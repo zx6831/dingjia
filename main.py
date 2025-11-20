@@ -4,7 +4,6 @@ from __future__ import annotations
 from typing import List, Optional, Any, Dict
 import asyncio
 import os, uuid, shutil
-from threading import Lock
 
 import uvicorn
 from fastapi import FastAPI, Query, HTTPException, UploadFile, File, Form, status
@@ -69,7 +68,6 @@ def _task_add_documents(doc_path: str):
 # 全局单例（进程内）
 _vm: Optional[VectorManager] = None
 _reranker: Optional[QAPairRerankerA] = None
-_reranker_lock = Lock()
 
 @app.on_event("startup")
 def _startup():
@@ -174,7 +172,7 @@ async def rerank(
     body: RerankBody,
     topk: int = Query(1, ge=1, le=50, description="最终返回条数"),
     # 这里不能写 ge=topk，改成常量；再在函数体里校验
-    pool_size: int = Query(60, ge=1, le=500, description="重排池大小（最大召回数量）"),
+    pool_size: int = Query(5, ge=1, le=500, description="重排池大小（最大召回数量）"),
     lambda_mmr: float = Query(0.7, ge=0.0, le=1.0, description="MMR 多样性权重"),
     max_score: float = Query(100, description="召回的最大距离阈值"),
 ):
@@ -187,19 +185,13 @@ async def rerank(
     queries = body.query
 
     def _do_rerank(query: str):
-        with _reranker_lock:
-            _reranker.topk = topk
-            _reranker.pool_size = pool_size
-            _reranker.lambda_mmr = lambda_mmr
-            return _reranker.search_and_rerank(query, max_score=max_score)
-
-    original_texts: List[str] = []
-    translated_texts: List[str] = []
-    for query in queries:
-        try:
-            ranked = await loop.run_in_executor(None, _do_rerank, query)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"{e}")
+        ranked = _reranker.search_and_rerank(
+            query,
+            max_score=max_score,
+            topk=topk,
+            pool_size=pool_size,
+            lambda_mmr=lambda_mmr,
+        )
 
         english_text = ""
         chinese_text = ""
@@ -208,7 +200,17 @@ async def rerank(
             metadata = (getattr(top_doc, "metadata", {}) or {}) if top_doc else {}
             english_text = metadata.get("english") or ""
             chinese_text = metadata.get("chinese") or ""
+        return english_text, chinese_text
 
+    tasks = [loop.run_in_executor(None, _do_rerank, q) for q in queries]
+    try:
+        results = await asyncio.gather(*tasks)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"{e}")
+
+    original_texts: List[str] = []
+    translated_texts: List[str] = []
+    for english_text, chinese_text in results:
         original_texts.append(english_text)
         translated_texts.append(chinese_text)
 

@@ -19,6 +19,14 @@ def _norm_vec(v: np.ndarray) -> np.ndarray:
     n = np.linalg.norm(v)
     return v if n == 0 else v / n
 
+def _norm_rows(mat: np.ndarray) -> np.ndarray:
+    mat = np.asarray(mat, dtype="float32")
+    if mat.ndim != 2:
+        return mat
+    norms = np.linalg.norm(mat, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    return mat / norms
+
 def _cos(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(_norm_vec(a), _norm_vec(b)))
 
@@ -73,7 +81,7 @@ class _BM25Lite:
 # --------- MMR 选样 ----------
 def mmr_select(
     q_vec: np.ndarray,
-    cand_q_vecs: List[np.ndarray],
+    cand_q_vecs: np.ndarray,
     k: int,
     lambda_mult: float = 0.7,
 ) -> List[int]:
@@ -85,25 +93,25 @@ def mmr_select(
         return []
     k = min(k, n)
     selected: List[int] = []
-    sim_to_q = np.array([_cos(q_vec, v) for v in cand_q_vecs], dtype="float32")
-    remaining = set(range(n))
+    # cand_q_vecs 与 q_vec 均视为已归一化
+    sim_to_q = np.asarray(cand_q_vecs @ q_vec, dtype="float32")
+    sim_matrix = np.asarray(cand_q_vecs @ cand_q_vecs.T, dtype="float32")
+    available = np.ones(n, dtype=bool)
 
-    first = int(np.argmax(sim_to_q))
-    selected.append(first)
-    remaining.remove(first)
-
-    while len(selected) < k and remaining:
-        best_i, best_score = None, -1e9
-        for i in list(remaining):
-            if selected:
-                max_sim_to_sel = max(_cos(cand_q_vecs[i], cand_q_vecs[j]) for j in selected)
-            else:
-                max_sim_to_sel = 0.0
-            s = lambda_mult * sim_to_q[i] - (1 - lambda_mult) * max_sim_to_sel
-            if s > best_score:
-                best_i, best_score = i, s
-        selected.append(best_i)
-        remaining.remove(best_i)
+    while len(selected) < k:
+        if not available.any():
+            break
+        if selected:
+            max_sim = sim_matrix[:, selected].max(axis=1)
+            scores = lambda_mult * sim_to_q - (1 - lambda_mult) * max_sim
+        else:
+            scores = sim_to_q.copy()
+        scores[~available] = -np.inf
+        next_idx = int(np.argmax(scores))
+        if not available[next_idx]:
+            break
+        selected.append(next_idx)
+        available[next_idx] = False
     return selected
 
 # --------- Q/A 重排器 ----------
@@ -143,38 +151,62 @@ class QAPairRerankerA:
             self.answer_len_penalty, self.answer_len_p95
         )
 
-    def search_and_rerank(self, query: str, max_score: float = 1e12) -> List[Dict[str, Any]]:
+    def search_and_rerank(
+        self,
+        query: str,
+        max_score: float = 1e12,
+        *,
+        topk: Optional[int] = None,
+        pool_size: Optional[int] = None,
+        lambda_mmr: Optional[float] = None,
+    ) -> List[Dict[str, Any]]:
         """
         用 vm.search 取候选池，再做 A 档重排，返回前 topk
         返回项字段：{doc, base_score, fuse_score, q_text, a_text}
         """
-        self.logger.info("Rerank:start tid=%s query=%s", query)
+        self.logger.info("Rerank:start query=%s", query)
 
-        raw: List[Tuple[Any, float]] = self.vm.search(query, k=self.pool_size, max_score=max_score)
-        self.logger.debug("Rerank:raw_candidates tid=%s count=%d", len(raw))
+        topk = topk if topk is not None else self.topk
+        pool_size = pool_size if pool_size is not None else self.pool_size
+        lambda_mmr = lambda_mmr if lambda_mmr is not None else self.lambda_mmr
+
+        raw: List[Tuple[Any, float]] = self.vm.search(query, k=pool_size, max_score=max_score)
+        self.logger.debug("Rerank:raw_candidates count=%d", len(raw))
         if not raw:
-            self.logger.warning("Rerank:empty tid=%s")
+            self.logger.warning("Rerank:empty")
             return []
 
         items: List[Dict[str, Any]] = []
         for d, base_score in raw:
             q_text, a_text = self._extract_qa_from_doc(d)
             items.append({"doc": d, "base_score": float(base_score), "q_text": q_text, "a_text": a_text})
-        self.logger.debug("Rerank:qa_extracted tid=%s with_Q=%d", sum(1 for x in items if x['q_text']))
+        self.logger.debug("Rerank:qa_extracted with_Q=%d", sum(1 for x in items if x['q_text']))
 
-        q_vec = np.asarray(self.emb.embed_query(query), dtype="float32")
-        q_vecs, a_vecs, q_tokens_all = [], [], []
-        for it in items:
-            qv = np.asarray(self.emb.embed_query(it["q_text"] or ""), dtype="float32")
-            av = np.asarray(self.emb.embed_query(it["a_text"] or ""), dtype="float32")
-            q_vecs.append(qv); a_vecs.append(av); q_tokens_all.append(_tokenize(it["q_text"] or ""))
+        q_vec = _norm_vec(np.asarray(self.emb.embed_query(query), dtype="float32"))
+        q_texts = [it["q_text"] or "" for it in items]
+        a_texts = [it["a_text"] or "" for it in items]
+        q_tokens_all = [_tokenize(text) for text in q_texts]
 
-        mmr_k = min(max(self.topk * 3, 20), len(items))
-        sel_idx = mmr_select(q_vec, q_vecs, k=mmr_k, lambda_mult=self.lambda_mmr)
-        self.logger.debug("Rerank:mmr_select tid=%s mmr_k=%d selected=%d", mmr_k, len(sel_idx))
+        q_vecs = np.asarray(self.emb.embed_documents(q_texts), dtype="float32")
+        a_vecs = np.asarray(self.emb.embed_documents(a_texts), dtype="float32")
+        q_vecs = _norm_rows(q_vecs)
+        a_vecs = _norm_rows(a_vecs)
+
+        mmr_ratio = 0.4  # 从候选池按比例先挑一截
+        mmr_min = max(8, topk * 2)  # 至少保留若干条（与 topk 成比例）
+        mmr_max = min(pool_size, topk * 6, 128)  # 给定合理上限，防止爆炸
+
+        mmr_k = min(
+            pool_size,
+            max(mmr_min, int(pool_size * mmr_ratio)),
+            mmr_max,
+        )
+
+        sel_idx = mmr_select(q_vec, q_vecs, k=mmr_k, lambda_mult=lambda_mmr)
+        self.logger.debug("Rerank:mmr_select mmr_k=%d selected=%d", mmr_k, len(sel_idx))
         pool = [items[i] for i in sel_idx]
-        pool_q_vecs = [q_vecs[i] for i in sel_idx]
-        pool_a_vecs = [a_vecs[i] for i in sel_idx]
+        pool_q_vecs = q_vecs[sel_idx]
+        pool_a_vecs = a_vecs[sel_idx]
         pool_q_tokens = [q_tokens_all[i] for i in sel_idx]
 
         bm25 = _BM25Lite(pool_q_tokens)
@@ -182,8 +214,8 @@ class QAPairRerankerA:
         q_tokens = _tokenize(query)
         scored: List[Tuple[float, Dict[str, Any]]] = []
         for i, it in enumerate(pool):
-            cos_qQ = _cos(q_vec, pool_q_vecs[i])
-            cos_qA = _cos(q_vec, pool_a_vecs[i])
+            cos_qQ = float(np.dot(q_vec, pool_q_vecs[i]))
+            cos_qA = float(np.dot(q_vec, pool_a_vecs[i]))
             bm25_qQ = bm25.score(q_tokens, pool_q_tokens[i])
             overlap = 1.0 if (_entity_hits(query, it["q_text"]) or _entity_hits(query, it["a_text"])) else 0.0
 
@@ -200,13 +232,13 @@ class QAPairRerankerA:
 
             if i < 5:
                 self.logger.debug(
-                    "Rerank:feat tid=%s i=%d cos_qQ=%.4f cos_qA=%.4f bm25=%.4f overlap=%.1f fuse=%.4f q='%s'",
+                    "Rerank:feat i=%d cos_qQ=%.4f cos_qA=%.4f bm25=%.4f overlap=%.1f fuse=%.4f q='%s'",
                     i, cos_qQ, cos_qA, bm25_qQ, overlap, s, (it['q_text'][:60] if it['q_text'] else "")
                 )
 
         scored.sort(key=lambda x: x[0], reverse=True)
-        top = [it for _, it in scored[: self.topk]]
-        self.logger.info("Rerank:done tid=%s topk=%d pool=%d", len(top), len(pool))
+        top = [it for _, it in scored[: topk]]
+        self.logger.info("Rerank:done topk=%d pool=%d", len(top), len(pool))
         return top
 
     def _extract_qa_from_doc(self, doc) -> Tuple[str, str]:
