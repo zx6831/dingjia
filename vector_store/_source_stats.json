@@ -1,0 +1,16 @@
+[
+  {
+    "source": "C:\\Users\\zx\\PycharmProjects\\dingjia\\vector_store\\uploads\\172d255cbc414e21abbc212dcd54fe85_nejm_test_en2zh.csv",
+    "display_name": "nejm_test_en2zh.csv",
+    "start_seq": 1,
+    "end_seq": 2103,
+    "count": 2103
+  },
+  {
+    "source": "C:\\Users\\zx\\PycharmProjects\\dingjia\\vector_store\\uploads\\a41ac1ee38d9405f8ef73830b1d3e0bd_nejm_train_en2zh.csv",
+    "display_name": "nejm_train_en2zh.csv",
+    "start_seq": 2104,
+    "end_seq": 64231,
+    "count": 62128
+  }
+]
