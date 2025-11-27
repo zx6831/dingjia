@@ -1,0 +1,7 @@
+/logs/
+/docs/
+/scripts/
+/test/
+/.idea/
+/model/
+/vector_store/
